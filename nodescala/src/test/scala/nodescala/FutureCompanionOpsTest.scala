@@ -9,6 +9,8 @@ import org.scalatest.matchers.{ShouldMatchers, ClassicMatchers, Matchers}
 import scala.concurrent.duration.Duration
 import scala.concurrent.{Await, Future}
 
+import scala.concurrent.ExecutionContext.Implicits.global
+
 class FutureCompanionOpsTest extends FunSuite with ShouldMatchers{
   test("Always") {
     val future = Future.always("Chris")
