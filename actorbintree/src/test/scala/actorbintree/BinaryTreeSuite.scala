@@ -3,6 +3,8 @@
  */
 package actorbintree
 
+import java.security.cert.CRLReason
+
 import akka.actor.{ Props, ActorRef, ActorSystem }
 import org.scalatest.{ BeforeAndAfterAll, FlatSpec }
 import akka.testkit.{ TestProbe, ImplicitSender, TestKit }
@@ -129,6 +131,22 @@ class BinaryTreeSuite(_system: ActorSystem) extends TestKit(_system) with FunSui
     expectMsg(OperationFinished(14))
   }
 
+  test("Adding twice then removing") {
+    val topNode = system.actorOf(Props[BinaryTreeSet], "AddingTwice")
+
+    topNode ! Insert(testActor, id = 1, 1)
+    expectMsg(OperationFinished(1))
+
+    topNode ! Insert(testActor, id = 2, 1)
+    expectMsg(OperationFinished(2))
+
+    topNode ! Remove(testActor, 3, 1)
+    expectMsg(OperationFinished(3))
+
+    topNode ! Contains(testActor, 4, 1)
+    expectMsg(ContainsResult(4, false))
+  }
+
   //insert 0
 
   test("instruction example") {
@@ -154,6 +172,7 @@ class BinaryTreeSuite(_system: ActorSystem) extends TestKit(_system) with FunSui
 
     verify(requester, ops, expectedReplies)
   }
+
   
   test("behave identically to built-in set (includes GC)") {
     val rnd = new Random()

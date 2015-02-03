@@ -55,7 +55,12 @@ class BinaryTreeSet extends Actor with ActorLogging {
   import BinaryTreeSet._
   import BinaryTreeNode._
 
-  def createRoot: ActorRef = context.actorOf(BinaryTreeNode.props(0, initiallyRemoved = true), "RootNode")
+  var number = 0
+
+  def createRoot: ActorRef = {
+    number = number + 1
+    context.actorOf(BinaryTreeNode.props(0, initiallyRemoved = true), s"RootNode-$number")
+  }
 
   var root = createRoot
 
@@ -69,10 +74,16 @@ class BinaryTreeSet extends Actor with ActorLogging {
 
   // optional
   /** Accepts `Operation` and `GC` messages. */
-  val normal: Receive = {
+  val normal: Receive = LoggingReceive {
     case c: Operation => {
       root ! c
     }
+    case GC =>
+      val newRoot = createRoot
+      root ! CopyTo(newRoot)
+      context.become(garbageCollecting(newRoot))
+
+
   }
 
   // optional
@@ -80,7 +91,17 @@ class BinaryTreeSet extends Actor with ActorLogging {
     * `newRoot` is the root of the new binary tree where we want to copy
     * all non-removed elements into.
     */
-  def garbageCollecting(newRoot: ActorRef): Receive = ???
+  def garbageCollecting(newRoot: ActorRef): Receive = LoggingReceive {
+    case c: Operation => pendingQueue = pendingQueue :+ c
+    case GC => log.debug("ignoring GC request as already GCing")
+    case CopyFinished =>
+      log.debug("Garbage: Finished GC, playing events received in the mean timne")
+      root = newRoot
+      for (op <- pendingQueue) {
+        root ! op
+      }
+      context.become(normal)
+  }
 
 }
 
@@ -112,6 +133,7 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor wit
     case c @ Contains(requestor, id, requestedValue) =>
       // woohoo found it
       if (!removed && elem == requestedValue) {
+        log.debug(s"Contains True {}", this)
         requestor ! ContainsResult(id, true)
       } else {
         val side = if (requestedValue < elem) Left else Right
@@ -121,17 +143,22 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor wit
         }
       }
     case i @ Insert(requestor, id, insertedValue) =>
-      val side = if (insertedValue < elem) Left else Right
-      log.debug(s"Inserting value $insertedValue into side $side")
-      subtrees.get(side) match {
-        case Some(child) =>
-          log.debug(s"Already have a $side, forwarding")
-          child ! i
-        case None =>
-          log.debug(s"Inserting $insertedValue to my $side map before is $subtrees")
-          val newNode = context.actorOf(BinaryTreeNode.props(insertedValue), s"Node=$insertedValue")
-          subtrees += (side -> newNode)
-          requestor ! OperationFinished(id)
+      if (insertedValue == elem) {
+        removed = false
+        requestor ! OperationFinished(id)
+      } else {
+        val side = if (insertedValue < elem) Left else Right
+        log.debug(s"Inserting value $insertedValue into side $side")
+        subtrees.get(side) match {
+          case Some(child) =>
+            log.debug(s"Already have a $side, forwarding")
+            child ! i
+          case None =>
+            log.debug(s"Inserting $insertedValue to my $side map before is $subtrees")
+            val newNode = context.actorOf(BinaryTreeNode.props(insertedValue), s"Node=$insertedValue")
+            subtrees += (side -> newNode)
+            requestor ! OperationFinished(id)
+        }
       }
     case r @ Remove(requestor, id, elemToRemove) =>
       if (elem == elemToRemove) {
@@ -139,7 +166,26 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor wit
         requestor ! OperationFinished(id)
       } else {
         val side = if (elemToRemove < elem) Left else Right
-        subtrees(side) ! r
+        subtrees.get(side) match {
+          case Some(child) => child ! r
+          case None => requestor ! OperationFinished(id)
+        }
+      }
+    case copy @ CopyTo(treeToCopyTo) =>
+      val values = subtrees.values.toSet
+      values.foreach(_ ! copy)
+      if (!removed) {
+        log.debug(s"Garbage: Copying self requires insert and children {}", values)
+        treeToCopyTo ! Insert(self, -1, elem)
+        context.become(copying(values, false))
+      } else if (values.size == 0) {
+        log.debug(s"Garbage: No children and we're deleted {} {}", removed, values)
+        // nothing to do
+        finish()
+      } else {
+        // wait for our children to be done
+        log.debug(s"Garbage: Have children and we're deleted {} {}", removed, values)
+        context.become(copying(values, true))
       }
 
 
@@ -149,6 +195,24 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor wit
   /** `expected` is the set of ActorRefs whose replies we are waiting for,
     * `insertConfirmed` tracks whether the copy of this node to the new tree has been confirmed.
     */
-  def copying(expected: Set[ActorRef], insertConfirmed: Boolean): Receive = ???
+  def copying(expected: Set[ActorRef], insertConfirmed: Boolean): Receive = {
+    case CopyFinished =>
+      if (expected.size == 1 && insertConfirmed) {
+        finish()
+      } else {
+        context.become(copying(expected.tail, insertConfirmed))
+      }
+    case OperationFinished(_) =>
+      if (expected.size == 0) {
+        finish()
+      } else {
+        context.become(copying(expected, true))
+      }
+  }
+
+  def finish(): Unit = {
+    context.parent ! CopyFinished
+    context.stop(self)
+  }
 
 }
