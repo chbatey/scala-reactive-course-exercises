@@ -30,7 +30,7 @@ object Replica {
     def age = System.currentTimeMillis() - originalTime
   }
 
-  case class ReplicationWait(client: ActorRef, replicators: Set[ActorRef])
+  case class ReplicationWait(client: ActorRef, todo: Set[ActorRef])
 
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
@@ -70,7 +70,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   def leader(awaitingPersist: Map[Long, ActorRef], awaitingReplicate: Map[Long, ReplicationWait]): Receive = {
     case Replicas(replicas) =>
       log.info(s"Adding $replicas")
-      replicas.foreach( replica => {
+      (replicas - self).foreach( replica => {
+        log.info(s"Creating replicator for replica $replica")
         val replicator = context.actorOf(Props(classOf[Replicator], replica))
         secondaries += replica -> replicator
         replicators += replicator
@@ -80,40 +81,74 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case Insert(key, value, id) =>
       kv += key -> value
       val replicate = Replicate(key, Some(value), id)
-      replicators.foreach(replica => {
-        log.info(s"Forwarding snapshot to replicator $replicate")
-        replica ! replicate
-      })
-      context.system.scheduler.scheduleOnce(100 milliseconds, self, CheckReplicated(replicate))
+      val newAwaitingReplication: Map[Long, ReplicationWait] = replicateToAll(awaitingReplicate, id, replicate)
 
       persistAndSchedule(Persist(key, Some(value), id))
 
-      context.become(leader(awaitingPersist + (id -> sender), awaitingReplicate + (id -> ReplicationWait(sender, replicators))))
+      context.become(leader(awaitingPersist + (id -> sender), newAwaitingReplication))
     case Remove(key, id) =>
       kv -= key
+      val replicate = Replicate(key, None, id)
+      val newAwaitingReplication: Map[Long, ReplicationWait] = replicateToAll(awaitingReplicate, id, replicate)
       persistAndSchedule(Persist(key, None, id))
 
-      context.become(leader(awaitingPersist.+(id -> sender), awaitingReplicate))
+      context.become(leader(awaitingPersist.+(id -> sender), newAwaitingReplication))
     case Persisted(key, id) =>
       log.info(s"Operation persisted sending ack $id")
       if (!awaitingReplicate.get(id).isDefined)  {
         awaitingPersist(id) ! OperationAck(id)
       }
+      context.become(leader(awaitingPersist - id, awaitingReplicate))
     case checkPersist @ CheckPersist(persist, _) =>
       log.info(s"Received check persist $persist with age ${checkPersist.age}")
       awaitingPersist.get(persist.id ) match {
-        case None => log.debug("Persistence already suceeded")
+        case None => log.info("Persistence already suceeded")
         case Some(client) =>
           if (checkPersist.age > Timeout) {
+            log.info("Timeout reached for persist, sending operation, sending operation failed")
             client ! OperationFailed(persist.id)
           } else {
             persistAndSchedule(persist, Some(checkPersist))
           }
       }
     case checkReplicated @ CheckReplicated(replicate, _) =>
-      if (checkReplicated.age > Timeout) {
-        awaitingReplicate(replicate.id).client ! OperationFailed(replicate.id)
+      log.info(s"Received check replicated $replicate with age ${checkReplicated.age}")
+      awaitingReplicate.get(replicate.id) match {
+        case None => log.info(s"Already replicated for id ${replicate.id}")
+        case Some(relicateWait) => {
+          if (checkReplicated.age > Timeout) {
+            relicateWait.client ! OperationFailed(replicate.id)
+          }
+
+          context.system.scheduler.scheduleOnce(100 milliseconds, self, checkReplicated)
+        }
       }
+    case Replicated(key, id) =>
+      val awaitingReplicateForId : ReplicationWait = awaitingReplicate(id)
+      val newReplicateWait = awaitingReplicateForId.copy(todo = awaitingReplicateForId.todo - sender)
+      log.info(s"Received replicated, now waiting on ${newReplicateWait}")
+      if (newReplicateWait.todo.isEmpty) {
+        if (!awaitingPersist.get(id).isDefined) {
+          awaitingReplicateForId.client ! OperationAck(id)
+        }
+        context.become(leader(awaitingPersist, awaitingReplicate - id))
+      } else {
+        context.become(leader(awaitingPersist, awaitingReplicate + (id -> newReplicateWait)))
+      }
+  }
+
+  def replicateToAll(awaitingReplicate: Map[Long, ReplicationWait], id: Long, replicate: Replicate): Map[Long, ReplicationWait] = {
+    replicators.foreach(replica => {
+      log.info(s"Forwarding snapshot to replicator $replicate")
+      replica ! replicate
+    })
+    val newAwaitingReplication: Map[Long, ReplicationWait] = if (!replicators.isEmpty) {
+      context.system.scheduler.scheduleOnce(100 milliseconds, self, CheckReplicated(replicate))
+      awaitingReplicate + (id -> ReplicationWait(sender, replicators))
+    } else {
+      awaitingReplicate
+    }
+    newAwaitingReplication
   }
 
   private def persistAndSchedule(persist: Persist, checkPersist: Option[CheckPersist] = None) : Unit = {
@@ -149,7 +184,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case checkPersist @ CheckPersist(persist, _) =>
       log.info(s"Received check persist $persist")
       awaitingPersist.get(persist.id  ) match {
-        case None => log.debug("Persistence already suceeded")
+        case None => log.info("Persistence already suceeded")
         case Some(_) =>
           persistAndSchedule(persist)
       }

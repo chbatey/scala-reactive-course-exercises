@@ -43,9 +43,13 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
       val seq: Long = nextSeq
       context.system.scheduler.scheduleOnce(200 milliseconds, self, SnapshotCheck(seq))
       acks += seq -> (replica, r)
-      replica ! Snapshot(key, value, seq)
-    case SnapshotAck(key, seq) =>
+      val snapshot: Snapshot = Snapshot(key, value, seq)
+      log.info(s"Sending Snapshot to replica $snapshot")
+      replica ! snapshot
+    case ack @ SnapshotAck(key, seq) =>
+      log.info(s"Received $ack sending replicated")
       acks -= seq
+      context.parent ! Replicated(key, seq)
     case SnapshotCheck(seq) =>
       acks.get(seq) match {
         case Some(pair) =>
