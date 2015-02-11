@@ -23,7 +23,7 @@ class Step5_PrimaryPersistenceSpec extends TestKit(ActorSystem("Step5PrimaryPers
     system.shutdown()
   }
 
-  test("case1: Primary does not acknowledge updates which have not been persisted") {
+  test("case1: Primary does not acknowledge inserts which have not been persisted") {
     val arbiter = TestProbe()
     val persistence = TestProbe()
     val primary = system.actorOf(Replica.props(arbiter.ref, probeProps(persistence)), "case1-primary")
@@ -40,6 +40,32 @@ class Step5_PrimaryPersistenceSpec extends TestKit(ActorSystem("Step5PrimaryPers
     client.nothingHappens(100.milliseconds)
     persistence.reply(Persisted("foo", persistId))
     client.waitAck(setId)
+  }
+
+  test("case1a: Primary does not acknowledge deletes which have not been persisted") {
+    val arbiter = TestProbe()
+    val persistence = TestProbe()
+    val primary = system.actorOf(Replica.props(arbiter.ref, probeProps(persistence)), "case1a-primary")
+    val client = session(primary)
+
+    arbiter.expectMsg(Join)
+    arbiter.send(primary, JoinedPrimary)
+
+    val setId = client.set("foo", "bar")
+    val persistId = persistence.expectMsgPF() {
+      case Persist("foo", Some("bar"), id) => id
+    }
+    persistence.reply(Persisted("foo", persistId))
+    client.waitAck(setId)
+
+    val deleteId = client.remove("foo")
+    val persistIdForDelete = persistence.expectMsgPF() {
+      case Persist("foo", None, id) => id
+    }
+    client.nothingHappens(100.milliseconds)
+    persistence.reply(Persisted("foo", persistIdForDelete))
+    client.waitAck(deleteId)
+
   }
 
   test("case2: Primary retries persistence every 100 milliseconds") {

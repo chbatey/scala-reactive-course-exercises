@@ -1,9 +1,8 @@
 package kvstore
 
-import akka.actor.Props
-import akka.actor.Actor
-import akka.actor.ActorRef
+import akka.actor.{ActorLogging, Props, Actor, ActorRef}
 import scala.concurrent.duration._
+import scala.language.postfixOps
 
 object Replicator {
   case class Replicate(key: String, valueOption: Option[String], id: Long)
@@ -12,10 +11,12 @@ object Replicator {
   case class Snapshot(key: String, valueOption: Option[String], seq: Long)
   case class SnapshotAck(key: String, seq: Long)
 
+  case class SnapshotCheck(seq: Long)
+
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
 
-class Replicator(val replica: ActorRef) extends Actor {
+class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
   import Replicator._
   import Replica._
   import context.dispatcher
@@ -38,7 +39,21 @@ class Replicator(val replica: ActorRef) extends Actor {
   
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
-    case _ =>
+    case r @ Replicate(key, value, id) =>
+      val seq: Long = nextSeq
+      context.system.scheduler.scheduleOnce(200 milliseconds, self, SnapshotCheck(seq))
+      acks += seq -> (replica, r)
+      replica ! Snapshot(key, value, seq)
+    case SnapshotAck(key, seq) =>
+      acks -= seq
+    case SnapshotCheck(seq) =>
+      acks.get(seq) match {
+        case Some(pair) =>
+          log.debug(s"Message for seq ${seq} has not been acked, resending.")
+          context.system.scheduler.scheduleOnce(100 milliseconds, self, SnapshotCheck(seq))
+          pair._1 ! Snapshot(pair._2.key, pair._2.valueOption, seq)
+        case None => log.debug(s"Message for seq ${seq} has already been acked")
+      }
   }
 
 }
